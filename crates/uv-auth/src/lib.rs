@@ -3,11 +3,13 @@ use std::sync::{Arc, LazyLock};
 use tracing::trace;
 
 use cache::CredentialsCache;
-pub use credentials::Credentials;
+pub use credentials::{Credentials, Username};
 pub use index::{AuthPolicy, Index, Indexes};
 pub use keyring::KeyringProvider;
 pub use middleware::AuthMiddleware;
 use realm::Realm;
+pub use service::{Service, ServiceParseError};
+pub use store::{AuthScheme, TextCredentialStore, TomlCredentialError};
 use uv_redacted::DisplaySafeUrl;
 
 mod cache;
@@ -17,6 +19,8 @@ mod keyring;
 mod middleware;
 mod providers;
 mod realm;
+mod service;
+pub mod store;
 
 // TODO(zanieb): Consider passing a cache explicitly throughout
 

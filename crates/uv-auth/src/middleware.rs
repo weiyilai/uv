@@ -7,6 +7,9 @@ use reqwest::{Request, Response};
 use reqwest_middleware::{Error, Middleware, Next};
 use tracing::{debug, trace, warn};
 
+use uv_preview::{Preview, PreviewFeatures};
+use uv_redacted::DisplaySafeUrl;
+
 use crate::providers::HuggingFaceProvider;
 use crate::{
     CREDENTIALS_CACHE, CredentialsCache, KeyringProvider,
@@ -15,7 +18,7 @@ use crate::{
     index::{AuthPolicy, Indexes},
     realm::Realm,
 };
-use uv_redacted::DisplaySafeUrl;
+use crate::{TextCredentialStore, TomlCredentialError};
 
 /// Strategy for loading netrc files.
 enum NetrcMode {
@@ -51,12 +54,64 @@ impl NetrcMode {
     }
 }
 
+/// Strategy for loading text-based credential files.
+enum TextStoreMode {
+    Automatic(LazyLock<Option<TextCredentialStore>>),
+    Enabled(TextCredentialStore),
+    Disabled,
+}
+
+impl Default for TextStoreMode {
+    fn default() -> Self {
+        // TODO(zanieb): Reconsider this pattern. We're just mirroring the [`NetrcMode`]
+        // implementation for now.
+        Self::Automatic(LazyLock::new(|| {
+            let path = TextCredentialStore::default_file()
+                .inspect_err(|err| {
+                    warn!("Failed to determine credentials file path: {}", err);
+                })
+                .ok()?;
+
+            match TextCredentialStore::read(&path) {
+                Ok((store, _lock)) => {
+                    debug!("Loaded credential file {}", path.display());
+                    Some(store)
+                }
+                Err(TomlCredentialError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("No credentials file found at {}", path.display());
+                    None
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to load credentials from {}: {}",
+                        path.display(),
+                        err
+                    );
+                    None
+                }
+            }
+        }))
+    }
+}
+
+impl TextStoreMode {
+    /// Get the parsed credential store, if enabled.
+    fn get(&self) -> Option<&TextCredentialStore> {
+        match self {
+            Self::Automatic(lock) => lock.as_ref(),
+            Self::Enabled(store) => Some(store),
+            Self::Disabled => None,
+        }
+    }
+}
+
 /// A middleware that adds basic authentication to requests.
 ///
 /// Uses a cache to propagate credentials from previously seen requests and
-/// fetches credentials from a netrc file and the keyring.
+/// fetches credentials from a netrc file, TOML file, and the keyring.
 pub struct AuthMiddleware {
     netrc: NetrcMode,
+    text_store: TextStoreMode,
     keyring: Option<KeyringProvider>,
     cache: Option<CredentialsCache>,
     /// Auth policies for specific URLs.
@@ -64,16 +119,19 @@ pub struct AuthMiddleware {
     /// Set all endpoints as needing authentication. We never try to send an
     /// unauthenticated request, avoiding cloning an uncloneable request.
     only_authenticated: bool,
+    preview: Preview,
 }
 
 impl AuthMiddleware {
     pub fn new() -> Self {
         Self {
             netrc: NetrcMode::default(),
+            text_store: TextStoreMode::default(),
             keyring: None,
             cache: None,
             indexes: Indexes::new(),
             only_authenticated: false,
+            preview: Preview::default(),
         }
     }
 
@@ -90,10 +148,30 @@ impl AuthMiddleware {
         self
     }
 
+    /// Configure the text credential store to use.
+    ///
+    /// `None` disables authentication via text store.
+    #[must_use]
+    pub fn with_text_store(mut self, store: Option<TextCredentialStore>) -> Self {
+        self.text_store = if let Some(store) = store {
+            TextStoreMode::Enabled(store)
+        } else {
+            TextStoreMode::Disabled
+        };
+        self
+    }
+
     /// Configure the [`KeyringProvider`] to use.
     #[must_use]
     pub fn with_keyring(mut self, keyring: Option<KeyringProvider>) -> Self {
         self.keyring = keyring;
+        self
+    }
+
+    /// Configure the [`Preview`] features to use.
+    #[must_use]
+    pub fn with_preview(mut self, preview: Preview) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -375,6 +453,7 @@ impl AuthMiddleware {
             .as_ref()
             .is_ok_and(|response| response.error_for_status_ref().is_ok())
         {
+            // TODO(zanieb): Consider also updating the system keyring after successful use
             trace!("Updating cached credentials for {url} to {credentials:?}");
             self.cache().insert(&url, credentials);
         }
@@ -524,6 +603,35 @@ impl AuthMiddleware {
             debug!("Found credentials in netrc file for {url}");
             Some(credentials)
 
+        // Text credential store support.
+        } else if let Some(credentials) = self.text_store.get().and_then(|text_store| {
+            debug!("Checking text store for credentials for {url}");
+            text_store.get_credentials(url, credentials.as_ref().and_then(|credentials| credentials.username())).cloned()
+        }) {
+            debug!("Found credentials in plaintext store for {url}");
+            Some(credentials)
+        } else if let Some(credentials) = {
+            if self.preview.is_enabled(PreviewFeatures::NATIVE_AUTH) {
+                let native_store = KeyringProvider::native();
+                let username = credentials.and_then(|credentials| credentials.username());
+                let display_username = if let Some(username) = username {
+                    format!("{username}@")
+                } else {
+                    String::new()
+                };
+                if let Some(index_url) = maybe_index_url {
+                    debug!("Checking native store for credentials for index URL {}{}", display_username, index_url);
+                    native_store.fetch(DisplaySafeUrl::ref_cast(index_url), username).await
+                } else {
+                    debug!("Checking native store for credentials for URL {}{}", display_username, url);
+                    native_store.fetch(url, username).await
+                }
+            } else {
+                None
+            }
+        } {
+            debug!("Found credentials in native store for {url}");
+            Some(credentials)
         // N.B. The keyring provider performs lookups for the exact URL then falls back to the host.
         //      But, in the absence of an index URL, we cache the result per realm. So in that case,
         //      if a keyring implementation returns different credentials for different URLs in the
@@ -2138,6 +2246,132 @@ mod tests {
             DisplaySafeUrl::parse("https://user:password@pypi-proxy.fly.dev/basic-auth/simple")
                 .unwrap()
         );
+    }
+
+    #[test(tokio::test)]
+    async fn test_text_store_basic_auth() -> Result<(), Error> {
+        let username = "user";
+        let password = "password";
+
+        let server = start_test_server(username, password).await;
+        let base_url = Url::parse(&server.uri())?;
+
+        // Create a text credential store with matching credentials
+        let mut store = TextCredentialStore::default();
+        let service = crate::Service::try_from(base_url.to_string()).unwrap();
+        let credentials =
+            crate::Credentials::basic(Some(username.to_string()), Some(password.to_string()));
+        store.insert(service.clone(), credentials);
+
+        let client = test_client_builder()
+            .with(
+                AuthMiddleware::new()
+                    .with_cache(CredentialsCache::new())
+                    .with_text_store(Some(store)),
+            )
+            .build();
+
+        assert_eq!(
+            client.get(server.uri()).send().await?.status(),
+            200,
+            "Credentials should be pulled from the text store"
+        );
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_text_store_disabled() -> Result<(), Error> {
+        let username = "user";
+        let password = "password";
+        let server = start_test_server(username, password).await;
+
+        let client = test_client_builder()
+            .with(
+                AuthMiddleware::new()
+                    .with_cache(CredentialsCache::new())
+                    .with_text_store(None), // Explicitly disable text store
+            )
+            .build();
+
+        assert_eq!(
+            client.get(server.uri()).send().await?.status(),
+            401,
+            "Credentials should not be found when text store is disabled"
+        );
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_text_store_by_username() -> Result<(), Error> {
+        let username = "testuser";
+        let password = "testpass";
+        let wrong_username = "wronguser";
+
+        let server = start_test_server(username, password).await;
+        let base_url = Url::parse(&server.uri())?;
+
+        let mut store = TextCredentialStore::default();
+        let service = crate::Service::try_from(base_url.to_string()).unwrap();
+        let credentials =
+            crate::Credentials::basic(Some(username.to_string()), Some(password.to_string()));
+        store.insert(service.clone(), credentials);
+
+        let client = test_client_builder()
+            .with(
+                AuthMiddleware::new()
+                    .with_cache(CredentialsCache::new())
+                    .with_text_store(Some(store)),
+            )
+            .build();
+
+        // Request with matching username should succeed
+        let url_with_username = format!(
+            "{}://{}@{}",
+            base_url.scheme(),
+            username,
+            base_url.host_str().unwrap()
+        );
+        let url_with_port = if let Some(port) = base_url.port() {
+            format!("{}:{}{}", url_with_username, port, base_url.path())
+        } else {
+            format!("{}{}", url_with_username, base_url.path())
+        };
+
+        assert_eq!(
+            client.get(&url_with_port).send().await?.status(),
+            200,
+            "Request with matching username should succeed"
+        );
+
+        // Request with non-matching username should fail
+        let url_with_wrong_username = format!(
+            "{}://{}@{}",
+            base_url.scheme(),
+            wrong_username,
+            base_url.host_str().unwrap()
+        );
+        let url_with_port = if let Some(port) = base_url.port() {
+            format!("{}:{}{}", url_with_wrong_username, port, base_url.path())
+        } else {
+            format!("{}{}", url_with_wrong_username, base_url.path())
+        };
+
+        assert_eq!(
+            client.get(&url_with_port).send().await?.status(),
+            401,
+            "Request with non-matching username should fail"
+        );
+
+        // Request without username should succeed
+        assert_eq!(
+            client.get(server.uri()).send().await?.status(),
+            200,
+            "Request with no username should succeed"
+        );
+
+        Ok(())
     }
 
     fn create_request(url: &str) -> Request {
